@@ -1,0 +1,15 @@
+{
+  "name": "bdi-proyecto-integracion-uam-azc-cbi",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Botiquín Digital Inteligente (BDI) - Monorepositorio client/server",
+  "scripts": {
+    "install:all": "npm --prefix client install && npm --prefix server install",
+    "dev:client": "npm --prefix client run dev",
+    "dev:server": "npm --prefix server run dev",
+    "build:client": "npm --prefix client run build",
+    "start:server": "npm --prefix server start",
+    "db:setup": "mysql -u root -p < database/schema.sql"
+  },
+  "license": "ISC"
+}
