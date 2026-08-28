@@ -1,8 +1,8 @@
 # Estado del Proyecto BDI - Botiquín Digital Inteligente
 
-> **Versión del documento:** v3.0
-> **Última actualización:** 2026-08-17
-> **Hito actual:** Notificaciones de caducidad por correo (implementado; pendiente solo la verificación de entrega real con credenciales SMTP)
+> **Versión del documento:** v4.1
+> **Última actualización:** 2026-08-28
+> **Hito actual:** 10 — Escáner de medicamentos con IA (implementado y verificado E2E + campo)
 
 ---
 
@@ -94,6 +94,25 @@ el frontend nunca se comunica directamente con la base de datos.
 - **Configuración:** variables `SMTP_HOST/PORT/SECURE/USER/PASS`, `EMAIL_FROM`, `NOTIF_CRON_*`
   agregadas a `env.js`, `server/.env.example` y `server/.env` (placeholders vacíos listos para rellenar).
 
+### 10. Escáner de Medicamentos con IA (completo)
+- **Capa de Lógica:** `POST /api/inventario/analizar` en `inventarioController.analizar()`.
+  - Recibe `{ imagenBase64 }` (data URL), la comprime con `sharp` (máx. 1280px, JPEG q80)
+    para reducir consumo de tokens del plan gratuito de Groq.
+  - Prompt estricto (JSON puro, campos del botiquín) + `response_format json_object`,
+    modelo `qwen/qwen3.6-27b`, reintento automático ante `json_validate_failed`.
+  - `sanitizarExtraidos()`: normaliza fechas (YYYY-MM-DD), unidades contra la lista
+    permitida, cantidades 0-999999, máx. 20 medicamentos; descarta los sin nombre.
+  - Aprendizaje importante (documentado para el equipo): el modelo piensa
+    (chain-of-thought) antes del JSON; sin `response_format` devuelve `<think>...`.
+    `max_completion_tokens` altos exceden el límite de 8,000 TPM del plan gratuito.
+    La compresión de imagen fue clave (análisis en ~2.7s).
+- **Capa de Visualización:** `Inventario.jsx` — botón "📷 Escanear Medicamento con IA"
+  (una columna, estático y amplio), zona de captura (clic/arrastrar, `capture="environment"`
+  para cámara móvil), vista previa, botones "Cambiar foto" / "Analizar con IA", lista de
+  medicamentos detectados con "Usar estos datos" → prellenan el formulario existente
+  (validación humana obligatoria) → guarda con `POST /api/inventario` (reutilizado).
+- Sin cambios de esquema de BD (usa la tabla `medicamentos` existente).
+
 ---
 
 ## Arquitectura (3 capas)
@@ -144,6 +163,7 @@ database/schema.sql
 | DELETE | `/api/recetas/:id` | Eliminar receta |
 | GET | `/api/inventario` | Botiquín con resumen |
 | GET | `/api/inventario/alertas` | Recordatorios de caducidad (umbral en días) |
+| POST | `/api/inventario/analizar` | Analiza foto de empaque con IA (Groq Vision) |
 | POST | `/api/inventario` | Agregar medicamento |
 | POST | `/api/inventario/batch` | Agregar lote (máx. 50) |
 | PUT | `/api/inventario/:id` | Actualizar medicamento |
@@ -169,13 +189,33 @@ database/schema.sql
   - `POST /notificaciones/probar`: 503 con mensaje claro (SMTP aún sin credenciales).
   - Regresión de `/inventario` y `/inventario/alertas?dias=45` OK.
   - Scheduler registra "Notificaciones automáticas deshabilitadas" con `NOTIF_CRON_ENABLED=false`.
-- PENDIENTE: prueba de entrega real del correo. Requiere App Password de Gmail en `server/.env`
-  (`SMTP_USER`, `SMTP_PASS`, `EMAIL_FROM`); después usar `POST /api/notificaciones/probar`
-  o activar `NOTIF_CRON_ENABLED=true` para el envío diario automático.
+- ENTREGA REAL VERIFICADA (2026-08-17): con App Password de Gmail configurada en `server/.env`
+  (`SMTP_USER` corregido al correo completo), `POST /api/notificaciones/probar` respondió 200 y el
+  correo llegó a la bandeja del usuario (messageId de Gmail confirmado). Asunto:
+  "BDI [Prueba]: todo en orden en tu botiquín" (botiquín vacío en ese momento).
+- Repositorio publicado en GitHub: https://github.com/cecf-dev/bdi-proyecto-integracion-uam-azc-cbi
+  (commit inicial `a109878` en `main`).
+- Hito 10 verificado E2E (servidor real puerto 5095 + JWT real + Groq real):
+  - `POST /api/inventario/analizar`: 401 sin token, 400 sin imagen.
+  - Con imagen sintética de caja de medicamento (SVG→PNG): 200 en ~2.7s extrayendo
+    nombre "PARACETAMOL", dosis "500 mg", 20 tabletas, lote "AB1234" y caducidad
+    "01/2027" → "2027-01-31" (regla de último día del mes aplicada por la IA).
+  - `node --check` backend OK y `npm run build` cliente OK (bundle ~524 kB).
+- PRUEBA EN CAMPO (2026-08-28, servidor real puerto 5000 + JWT real + Groq real + navegador):
+  - Login con Google real, Dashboard e Inventario cargaron con 200.
+  - Escáner de medicamentos con imagen real: `POST /api/inventario/analizar` 200 en ~4.2s,
+    1 medicamento detectado y prellenado en el formulario para confirmación humana.
+  - Módulo escáner en campo: OK.
+- Diagnóstico Groq documentado: sin `response_format` el modelo emite `<think>`; con él
+  y la imagen comprimida el JSON es válido y rápido.
 
 ## Notas del Entorno
 
 - Puertos TCP 5060-5061 bloqueados en la máquina Windows local; usar 5090+ para pruebas.
+- IMPORTANTE (2026-08-28): el backend debe arrancar en su puerto nativo `PORT=5000`, que es
+  el que esperan el frontend (`client/.env VITE_API_URL`) y el proxy de Vite (`vite.config.js`).
+  No forzar `PORT` al iniciar el backend por terminal (heredado al proceso hijo), o el login
+  fallará con "Error de conexión" (`api.js` status 0) por no coincidir con el puerto esperado.
 - Bundle JS ~518 kB (Leaflet + React + speech); warning de tamaño, candidato a code-splitting.
 - El modelo `usuarios` guarda el email de Google (destinatario de las notificaciones, ya en uso).
 - Migración 003 ya aplicada a la BD local (`bdi_db`); no ejecutarla dos veces.
@@ -184,16 +224,12 @@ database/schema.sql
 
 ## Siguiente Paso Lógico (pendiente)
 
-### Verificación de entrega real del correo (requiere acción del equipo)
-
-1. Generar una App Password de Gmail (https://myaccount.google.com/apppasswords)
-   y completar `SMTP_USER`, `SMTP_PASS`, `EMAIL_FROM` en `server/.env`.
-2. Iniciar el servidor y ejecutar `POST /api/notificaciones/probar` (o el botón
-   "Enviar correo de prueba" del Dashboard) y confirmar la recepción.
-3. Decidir si se activa el envío automático diario (`NOTIF_CRON_ENABLED=true`).
-
 ### Candidatos para el siguiente hito (NO iniciar sin indicación del equipo)
 
-- Code-splitting del bundle del cliente (Leaflet + react-speech-recognition cargados perezosamente).
-- Historial de envíos en BD (tabla `notificaciones_enviadas` + vista en el Dashboard).
+- ✔ REALIZADO (2026-08-28): prueba en campo del hito 10 con imagen real desde el navegador → OK.
+- Opción híbrida del hito 10: decodificación de código GS1 DataMatrix (GTIN/lote/caducidad
+  exactos) con ZXing-js; si no se detecta, caer al análisis visual con Groq.
+- Historial de envíos de notificaciones en BD (tabla `notificaciones_enviadas` + vista en el Dashboard).
+- Code-splitting del bundle del cliente (~524 kB; Leaflet + react-speech-recognition perezosos).
 - Soporte offline/PWA del Dashboard.
+- Activar `NOTIF_CRON_ENABLED=true` en producción una vez desplegado.

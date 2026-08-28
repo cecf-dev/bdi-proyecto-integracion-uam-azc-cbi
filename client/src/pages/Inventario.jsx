@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import api from '../services/api';
 
 const ESTADOS_BADGE = {
@@ -47,6 +47,16 @@ export default function Inventario() {
   const [form, setForm] = useState(FORM_INICIAL);
   const [saving, setSaving] = useState(false);
   const [formError, setFormError] = useState(null);
+
+  const [showScanner, setShowScanner] = useState(false);
+  const [scanPreview, setScanPreview] = useState(null);
+  const [scanBase64, setScanBase64] = useState(null);
+  const [isDraggingScan, setIsDraggingScan] = useState(false);
+  const [scanning, setScanning] = useState(false);
+  const [scanError, setScanError] = useState(null);
+  const [scanResults, setScanResults] = useState([]);
+  const [scanDone, setScanDone] = useState(false);
+  const scanInputRef = useRef(null);
 
   const cargarInventario = useCallback(async () => {
     setLoading(true);
@@ -145,6 +155,103 @@ export default function Inventario() {
     }
   };
 
+  // ===== Escáner de medicamentos con IA =====
+
+  const abrirScanner = () => {
+    setShowScanner(true);
+    setScanPreview(null);
+    setScanBase64(null);
+    setScanError(null);
+    setScanResults([]);
+    setScanDone(false);
+  };
+
+  const cerrarScanner = () => {
+    setShowScanner(false);
+  };
+
+  const handleScanFileSelect = (selectedFile) => {
+    if (!selectedFile) return;
+
+    if (!selectedFile.type.startsWith('image/')) {
+      setScanError('Por favor, selecciona una imagen (JPG, PNG).');
+      return;
+    }
+
+    setScanError(null);
+    setScanResults([]);
+    setScanDone(false);
+
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      setScanPreview(e.target.result);
+      setScanBase64(e.target.result);
+    };
+    reader.onerror = () => {
+      setScanError('Ocurrió un error al leer el archivo.');
+    };
+    reader.readAsDataURL(selectedFile);
+  };
+
+  const handleScanDragOver = (e) => {
+    e.preventDefault();
+    setIsDraggingScan(true);
+  };
+
+  const handleScanDragLeave = (e) => {
+    e.preventDefault();
+    setIsDraggingScan(false);
+  };
+
+  const handleScanDrop = (e) => {
+    e.preventDefault();
+    setIsDraggingScan(false);
+    if (e.dataTransfer.files && e.dataTransfer.files[0]) {
+      handleScanFileSelect(e.dataTransfer.files[0]);
+    }
+  };
+
+  const analizarImagen = async () => {
+    if (!scanBase64) return;
+
+    setScanning(true);
+    setScanError(null);
+    setScanResults([]);
+    setScanDone(false);
+
+    try {
+      const resp = await api.post('/inventario/analizar', {
+        imagenBase64: scanBase64,
+      });
+      setScanResults(resp.data?.medicamentos || []);
+      setScanDone(true);
+    } catch (err) {
+      console.error(err);
+      setScanError(err?.message || 'No se pudo analizar la imagen.');
+    } finally {
+      setScanning(false);
+    }
+  };
+
+  const usarExtraido = (med) => {
+    setForm({
+      nombre: med.nombre || '',
+      principio_activo: med.principio_activo || '',
+      dosis: med.dosis || '',
+      presentacion: med.presentacion || '',
+      cantidad: String(med.cantidad ?? 0),
+      unidad: med.unidad || 'piezas',
+      fecha_caducidad: med.fecha_caducidad ? String(med.fecha_caducidad).slice(0, 10) : '',
+      lote: med.lote || '',
+      codigo_barras: med.codigo_barras || '',
+      notas: med.notas || '',
+    });
+    setEditingId(null);
+    setFormError(null);
+    setShowForm(true);
+    cerrarScanner();
+  };
+
   return (
     <div className="max-w-2xl mx-auto p-4 py-8 animate-fade-in">
       <div className="mb-6 text-center">
@@ -215,15 +322,147 @@ export default function Inventario() {
         </div>
       )}
 
-      {/* Botón agregar / cancelar (estático y amplio) */}
-      {!showForm ? (
-        <button
-          onClick={abrirFormNuevo}
-          className="w-full py-4 px-6 bg-primary-600 hover:bg-primary-700 text-white font-bold rounded-xl shadow-lg shadow-primary-500/30 transition-colors active:bg-primary-800 mb-6"
-        >
-          + Agregar Medicamento
-        </button>
-      ) : (
+      {/* Botones agregar / escanear (estáticos y amplios) */}
+      {!showForm && !showScanner && (
+        <div className="flex flex-col gap-3 mb-6">
+          <button
+            onClick={abrirFormNuevo}
+            className="w-full py-4 px-6 bg-primary-600 hover:bg-primary-700 text-white font-bold rounded-xl shadow-lg shadow-primary-500/30 transition-colors active:bg-primary-800"
+          >
+            + Agregar Medicamento
+          </button>
+          <button
+            onClick={abrirScanner}
+            className="w-full py-4 px-6 bg-white border-2 border-primary-200 hover:border-primary-400 hover:bg-primary-50 text-primary-700 font-bold rounded-xl transition-colors active:bg-primary-100"
+          >
+            📷 Escanear Medicamento con IA
+          </button>
+        </div>
+      )}
+
+      {/* Escáner de medicamentos con IA (captura → analizar → prellenar) */}
+      {showScanner && (
+        <div className="bg-white rounded-2xl shadow-lg border border-surface-200 p-4 sm:p-6 mb-6">
+          <div className="flex items-center justify-between mb-4">
+            <h2 className="text-lg font-bold text-surface-800">Escanear Medicamento</h2>
+            <button
+              onClick={cerrarScanner}
+              className="text-surface-400 hover:text-red-500 font-medium text-sm transition-colors"
+            >
+              Cerrar
+            </button>
+          </div>
+
+          {!scanPreview ? (
+            <div
+              className={`border-2 border-dashed rounded-2xl p-8 text-center cursor-pointer h-64 flex flex-col items-center justify-center transition-colors
+                ${isDraggingScan ? 'border-primary-500 bg-primary-50' : 'border-surface-300 hover:border-primary-400 hover:bg-surface-50'}`}
+              onDragOver={handleScanDragOver}
+              onDragLeave={handleScanDragLeave}
+              onDrop={handleScanDrop}
+              onClick={() => scanInputRef.current?.click()}
+            >
+              <input
+                type="file"
+                ref={scanInputRef}
+                onChange={(e) => handleScanFileSelect(e.target.files?.[0])}
+                accept="image/*"
+                capture="environment"
+                className="hidden"
+              />
+
+              <div className="w-16 h-16 rounded-full bg-surface-100 flex items-center justify-center mb-4 text-surface-500">
+                <svg className="w-8 h-8" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M6.827 6.175A2.31 2.31 0 015.186 7.23c-.38.054-.757.112-1.134.175C2.999 7.58 2.25 8.507 2.25 9.574V18a2.25 2.25 0 002.25 2.25h15A2.25 2.25 0 0021.75 18V9.574c0-1.067-.75-1.994-1.802-2.169a47.865 47.865 0 00-1.134-.175 2.31 2.31 0 01-1.64-1.055l-.822-1.316a2.192 2.192 0 00-1.736-1.039 48.774 48.774 0 00-5.232 0 2.192 2.192 0 00-1.736 1.039l-.821 1.316z" />
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M16.5 12.75a4.5 4.5 0 11-9 0 4.5 4.5 0 019 0zM18.75 10.5h.008v.008h-.008V10.5z" />
+                </svg>
+              </div>
+
+              <p className="text-surface-700 font-medium mb-1">
+                Haz clic o arrastra la foto del empaque aquí
+              </p>
+              <p className="text-xs text-surface-400">
+                La imagen se convertirá a Base64 y se analizará con IA.
+              </p>
+            </div>
+          ) : (
+            <div>
+              <div className="rounded-xl overflow-hidden bg-surface-100 h-64">
+                <img
+                  src={scanPreview}
+                  alt="Vista previa del empaque"
+                  className="w-full h-full object-contain"
+                />
+              </div>
+
+              <div className="flex flex-col gap-3 mt-4">
+                <button
+                  onClick={() => scanInputRef.current?.click()}
+                  disabled={scanning}
+                  className="w-full py-4 px-6 bg-surface-100 hover:bg-surface-200 text-surface-700 font-bold rounded-xl transition-colors active:bg-surface-300 disabled:opacity-50"
+                >
+                  Cambiar foto
+                </button>
+                <button
+                  onClick={analizarImagen}
+                  disabled={scanning}
+                  className="w-full py-4 px-6 bg-primary-600 hover:bg-primary-700 text-white font-bold rounded-xl transition-colors active:bg-primary-800 disabled:opacity-60"
+                >
+                  {scanning ? 'Analizando con IA...' : 'Analizar con IA'}
+                </button>
+              </div>
+            </div>
+          )}
+
+          {scanning && (
+            <div className="text-center py-6">
+              <div className="w-10 h-10 mx-auto border-4 border-surface-200 border-t-primary-500 rounded-full animate-spin"></div>
+              <p className="text-surface-500 mt-4 text-sm">Analizando imagen con IA...</p>
+            </div>
+          )}
+
+          {scanError && (
+            <div className="mt-4 p-4 bg-red-50 border border-red-200 text-red-700 rounded-xl text-sm">
+              {scanError}
+            </div>
+          )}
+
+          {scanDone && scanResults.length === 0 && (
+            <div className="mt-4 p-4 bg-yellow-50 border border-yellow-200 text-yellow-800 rounded-xl text-sm">
+              No se detectaron medicamentos en la imagen. Intenta con una foto más cercana y nítida del empaque.
+            </div>
+          )}
+
+          {scanDone && scanResults.length > 0 && (
+            <div className="mt-4">
+              <p className="text-xs text-yellow-800 bg-yellow-50 border border-yellow-200 rounded-lg p-3 mb-3">
+                Datos extraídos por IA. Revísalos en el formulario antes de guardar.
+              </p>
+              <div className="flex flex-col gap-3">
+                {scanResults.map((med, i) => (
+                  <div key={i} className="border border-surface-200 rounded-xl p-3">
+                    <p className="text-sm font-bold text-surface-900">{med.nombre}</p>
+                    <p className="text-xs text-surface-500 mt-0.5">
+                      {[med.dosis, med.presentacion].filter(Boolean).join(' · ')}
+                      {med.fecha_caducidad ? ` · Caduca: ${med.fecha_caducidad}` : ''}
+                      {med.lote ? ` · Lote: ${med.lote}` : ''}
+                    </p>
+                    <button
+                      onClick={() => usarExtraido(med)}
+                      className="mt-3 w-full py-3 px-4 bg-primary-600 hover:bg-primary-700 text-white font-bold rounded-xl transition-colors active:bg-primary-800"
+                    >
+                      Usar estos datos
+                    </button>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Formulario agregar/editar */}
+      {showForm && (
         <div className="bg-white rounded-2xl shadow-lg border border-surface-200 p-4 sm:p-6 mb-6">
           <h2 className="text-lg font-bold text-surface-800 mb-4">
             {editingId ? 'Editar Medicamento' : 'Nuevo Medicamento'}
@@ -403,7 +642,7 @@ export default function Inventario() {
       )}
 
       {/* Estado vacío */}
-      {!loading && !error && medicamentos.length === 0 && !showForm && (
+      {!loading && !error && medicamentos.length === 0 && !showForm && !showScanner && (
         <div className="bg-white rounded-2xl shadow-lg border border-surface-200 p-10 text-center">
           <div className="w-16 h-16 mx-auto mb-4 rounded-full bg-surface-100 flex items-center justify-center text-surface-400">
             <svg className="w-8 h-8" fill="none" viewBox="0 0 24 24" stroke="currentColor">

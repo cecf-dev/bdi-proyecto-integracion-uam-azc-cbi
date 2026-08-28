@@ -1,10 +1,18 @@
 /**
  * BDI - Controlador de Inventario (Botiquín)
  * 
- * Lógica de negocio para el CRUD de medicamentos del usuario autenticado.
+ * Lógica de negocio para el CRUD de medicamentos del usuario autenticado
+ * y para el análisis con IA de fotografías de empaques de medicamentos.
  */
 
+const Groq = require('groq-sdk');
+const sharp = require('sharp');
 const medicamentoModel = require('../models/medicamentoModel');
+
+// Inicializar SDK de Groq con la variable de entorno
+const groq = new Groq({
+  apiKey: process.env.GROQ_API_KEY
+});
 
 const UNIDADES_PERMITIDAS = ['piezas', 'tabletas', 'capsulas', 'ml', 'mg', 'sobres', 'tubos', 'frascos'];
 
@@ -77,7 +85,194 @@ const normalizarDatos = (body) => {
   };
 };
 
+/**
+ * Sanea la respuesta de la IA: normaliza tipos, fechas y unidades
+ * para que los datos sean compatibles con normalizarDatos() al guardar.
+ * 
+ * @param {Object} data - JSON devuelto por Groq
+ * @returns {Array<Object>} Medicamentos extraídos listos para el formulario
+ */
+const sanitizarExtraidos = (data) => {
+  const lista = Array.isArray(data?.medicamentos) ? data.medicamentos : [];
+
+  return lista
+    .slice(0, 20)
+    .map((m) => {
+      const campoTexto = (v) => (typeof v === 'string' && v.trim() !== '' ? v.trim() : null);
+
+      // Fecha: aceptar solo YYYY-MM-DD (o el prefijo de una fecha ISO)
+      let fecha = campoTexto(m?.fecha_caducidad);
+      if (fecha) {
+        const match = fecha.match(/^(\d{4})-(\d{2})-(\d{2})/);
+        fecha = match ? `${match[1]}-${match[2]}-${match[3]}` : null;
+      }
+
+      // Unidad: normalizar contra la lista permitida (default 'piezas')
+      let unidad = campoTexto(m?.unidad)?.toLowerCase() || 'piezas';
+      if (!UNIDADES_PERMITIDAS.includes(unidad)) unidad = 'piezas';
+
+      let cantidad = parseInt(m?.cantidad, 10);
+      if (Number.isNaN(cantidad) || cantidad < 0 || cantidad > 999999) cantidad = 0;
+
+      return {
+        nombre: campoTexto(m?.nombre),
+        principio_activo: campoTexto(m?.principio_activo),
+        dosis: campoTexto(m?.dosis),
+        presentacion: campoTexto(m?.presentacion),
+        cantidad,
+        unidad,
+        fecha_caducidad: fecha,
+        lote: campoTexto(m?.lote),
+        codigo_barras: campoTexto(m?.codigo_barras),
+        notas: campoTexto(m?.notas),
+      };
+    })
+    .filter((m) => m.nombre);
+};
+
+/**
+ * Comprime la imagen (data URL) antes de enviarla a Groq:
+ * reduce resolución y la convierte a JPEG para consumir menos tokens
+ * (importante en el plan gratuito de Groq) y acelerar el análisis.
+ * Si la imagen no es válida o falla el procesamiento, devuelve la original.
+ * 
+ * @param {string} dataUrl - Imagen en Base64 con prefijo data:image/...
+ * @returns {Promise<string>} Data URL comprimido (JPEG) u original
+ */
+const comprimirImagen = async (dataUrl) => {
+  try {
+    const coincidencia = dataUrl.match(/^data:image\/[\w.+-]+;base64,(.+)$/);
+    if (!coincidencia) return dataUrl;
+
+    const buffer = Buffer.from(coincidencia[1], 'base64');
+    const comprimido = await sharp(buffer)
+      .resize({ width: 1280, height: 1280, fit: 'inside', withoutEnlargement: true })
+      .jpeg({ quality: 80 })
+      .toBuffer();
+
+    return `data:image/jpeg;base64,${comprimido.toString('base64')}`;
+  } catch (error) {
+    console.warn('No se pudo comprimir la imagen; se enviará la original:', error.message);
+    return dataUrl;
+  }
+};
+
 const inventarioController = {
+  /**
+   * POST /api/inventario/analizar
+   * Recibe una foto (Base64) de un empaque de medicamento y la envía a
+   * Llama 3 Vision (Groq) para extraer sus datos clave. Devuelve los
+   * medicamentos detectados; el guardado real lo hace el usuario desde
+   * el formulario (POST /api/inventario), reutilizando la validación humana.
+   */
+  async analizar(req, res, next) {
+    try {
+      const usuarioId = req.user?.id;
+      if (!usuarioId) {
+        const error = new Error('Usuario no autenticado');
+        error.statusCode = 401;
+        throw error;
+      }
+
+      const { imagenBase64 } = req.body;
+
+      // Validar que la cadena base64 no venga vacía
+      if (!imagenBase64 || typeof imagenBase64 !== 'string') {
+        const error = new Error('No se ha proporcionado la imagen en Base64 o el formato es incorrecto');
+        error.statusCode = 400;
+        throw error;
+      }
+
+      // Comprimir la imagen para reducir consumo de tokens de Groq
+      const imagenComprimida = await comprimirImagen(imagenBase64);
+      console.log('Enviando imagen de medicamento a Llama 3 Vision (Groq)...');
+
+      // System Prompt estricto para asegurar JSON y campos normalizados
+      const systemPrompt = `
+      Eres un experto farmacéutico. Analiza la imagen de un empaque de medicamento (caja, frasco o blíster) y extrae sus datos clave.
+      REGLA CRÍTICA ABSOLUTA: devuelve ÚNICAMENTE un objeto JSON válido, sin explicaciones ni texto adicional fuera del JSON.
+      Estructura exacta del JSON:
+      { "medicamentos": [ { "nombre": "Nombre comercial", "principio_activo": "Principio activo", "dosis": "Dosis por unidad", "presentacion": "Presentacion", "cantidad": 0, "unidad": "piezas", "fecha_caducidad": "YYYY-MM-DD", "lote": "Lote", "codigo_barras": "Codigo de barras", "notas": "Observaciones" } ] }
+      REGLAS ADICIONALES:
+      - Si hay varios medicamentos visibles en la imagen, devuélvelos TODOS en el arreglo.
+      - Si un dato no es legible, usa "" para texto o 0 para cantidad. NUNCA inventes datos.
+      - Si la fecha de caducidad solo muestra mes y año, usa el último día de ese mes (YYYY-MM-DD).
+      - Si no se detecta ningún medicamento, devuelve { "medicamentos": [] }.
+      `;
+
+      // Petición a Groq con reintento ante fallos de validación JSON del modelo
+      let completion;
+      const maxIntentos = 2;
+
+      for (let intento = 1; intento <= maxIntentos; intento++) {
+        try {
+          completion = await groq.chat.completions.create({
+            messages: [
+              {
+                role: "system",
+                content: systemPrompt
+              },
+              {
+                role: "user",
+                content: [
+                  { type: "text", text: "Analiza este empaque de medicamento y devuelve el JSON solicitado." },
+                  {
+                    type: "image_url",
+                    image_url: {
+                      url: imagenComprimida
+                    }
+                  }
+                ]
+              }
+            ],
+            model: "qwen/qwen3.6-27b",
+            temperature: 0.1,
+            response_format: { type: "json_object" }
+          });
+          break;
+        } catch (apiError) {
+          const esFalloJson = apiError?.code === 'json_validate_failed';
+          if (!esFalloJson || intento === maxIntentos) throw apiError;
+          console.warn(`Groq falló la validación JSON (intento ${intento}); reintentando...`);
+        }
+      }
+
+      // Parsear la respuesta y manejar errores
+      const aiResponse = completion.choices[0].message.content;
+      let jsonData;
+
+      try {
+        jsonData = JSON.parse(aiResponse);
+      } catch (parseError) {
+        console.error('La IA no devolvió un JSON válido:', aiResponse);
+        const error = new Error('El análisis de IA falló al estructurar los datos (JSON inválido)');
+        error.statusCode = 500;
+        throw error;
+      }
+
+      // Sanear los datos extraídos para el formulario del cliente
+      const medicamentos = sanitizarExtraidos(jsonData);
+
+      console.log(`Análisis de medicamento exitoso: ${medicamentos.length} detectado(s)`);
+
+      res.status(200).json({
+        success: true,
+        message: medicamentos.length > 0
+          ? `Se detectaron ${medicamentos.length} medicamento(s) en la imagen.`
+          : 'No se detectaron medicamentos en la imagen.',
+        data: { medicamentos }
+      });
+
+    } catch (error) {
+      console.error('Error en analizar medicamento (Groq API):', error);
+      if (!error.statusCode) {
+        error.statusCode = 500;
+        error.message = 'Error interno al comunicarse con el motor de Inteligencia Artificial.';
+      }
+      next(error);
+    }
+  },
+
   /**
    * GET /api/inventario
    * Lista el botiquín del usuario con resumen de alertas de caducidad.

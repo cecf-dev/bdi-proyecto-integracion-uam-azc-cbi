@@ -110,6 +110,7 @@ npm run dev
 | Escáner de recetas | Captura en Base64, análisis con Groq (Llama 3 Vision), validación y guardado |
 | Historial de recetas | Listado paginado, detalle con imagen, edición y eliminación |
 | Inventario (botiquín) | CRUD de medicamentos con cálculo automático de caducidad (vigente / por vencer / caducado) |
+| Escáner de medicamentos | Foto del empaque → IA (Groq Vision) → prellenado del formulario → confirmación humana |
 | Receta → botiquín | Registro en lote de los medicamentos de una receta al guardarla |
 | Farmacias | Precios vía SerpApi (Google Shopping), farmacias cercanas (Google Maps + Leaflet) e historial de búsquedas |
 | Dashboard | Panel con resumen, alertas de caducidad y accesos rápidos |
@@ -131,6 +132,7 @@ Todas las rutas bajo `/api/recetas`, `/api/inventario`, `/api/farmacias` y
 | PUT | `/api/recetas/:id` | Edita datos clínicos y medicamentos |
 | DELETE | `/api/recetas/:id` | Elimina del historial (cascada) |
 | GET | `/api/inventario` | Botiquín con resumen de alertas |
+| POST | `/api/inventario/analizar` | Analiza foto de empaque con IA (Groq Vision) |
 | POST | `/api/inventario` | Agrega medicamento |
 | POST | `/api/inventario/batch` | Agrega lote (máx. 50, transaccional) |
 | PUT | `/api/inventario/:id` | Actualiza medicamento |

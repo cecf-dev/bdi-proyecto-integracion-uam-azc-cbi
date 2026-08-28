@@ -23,6 +23,12 @@ router.get('/', inventarioController.listar);
 router.get('/alertas', inventarioController.alertas);
 
 /**
+ * POST /api/inventario/analizar
+ * Analiza con IA la foto de un empaque de medicamento.
+ */
+router.post('/analizar', inventarioController.analizar);
+
+/**
  * POST /api/inventario
  * Agrega un medicamento al botiquín.
  */
