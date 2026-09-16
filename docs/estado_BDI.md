@@ -1,8 +1,9 @@
 # Estado del Proyecto BDI - Botiquín Digital Inteligente
 
-> **Versión del documento:** v4.1
-> **Última actualización:** 2026-08-28
+> **Versión del documento:** v5.0
+> **Última actualización:** 2026-09-15
 > **Hito actual:** 10 — Escáner de medicamentos con IA (implementado y verificado E2E + campo)
+> **Próximo hito:** 11 — Catálogo CIE-10 + mapeo de síntomas + filtro de relevancia
 
 ---
 
@@ -222,14 +223,289 @@ database/schema.sql
 
 ---
 
-## Siguiente Paso Lógico (pendiente)
+## Plan de Implementación Pendiente (Hitos 11–16)
 
-### Candidatos para el siguiente hito (NO iniciar sin indicación del equipo)
+> **Origen de este plan:** Auditoría de código completa (2026-09-15) documentada en
+> `Estado_Actividades_BDI.md`. Define los hitos para cerrar las brechas detectadas
+> (catálogo CIE-10 sin integrar, sin mapeador de síntomas ni filtro de relevancia,
+> cámara solo con `capture`, geolocalización no en tiempo real y sin búsqueda por
+> dirección, sin TTS, y sin pruebas automatizadas/carga/accesibilidad).
 
-- ✔ REALIZADO (2026-08-28): prueba en campo del hito 10 con imagen real desde el navegador → OK.
-- Opción híbrida del hito 10: decodificación de código GS1 DataMatrix (GTIN/lote/caducidad
-  exactos) con ZXing-js; si no se detecta, caer al análisis visual con Groq.
-- Historial de envíos de notificaciones en BD (tabla `notificaciones_enviadas` + vista en el Dashboard).
-- Code-splitting del bundle del cliente (~524 kB; Leaflet + react-speech-recognition perezosos).
-- Soporte offline/PWA del Dashboard.
-- Activar `NOTIF_CRON_ENABLED=true` en producción una vez desplegado.
+### Roadmap resumido
+
+| Hito | Entregable clave | Prioridad | Dependencias |
+|------|------------------|-----------|--------------|
+| 11 | CIE-10: catálogo + mapeo de síntomas + relevancia | Alta | Ninguna |
+| 12 | Cámara `getUserMedia` + geolocalización en tiempo real + búsqueda por dirección | Alta | Ninguna |
+| 13 | Accesibilidad por voz: STT de síntomas + TTS | Media | Hito 11 (mapeo CIE-10) |
+| 14 | Pruebas automatizadas de integración IA↔BD | Alta | Ninguna |
+| 15 | Pruebas de carga y rendimiento | Media | Hito 14 (mismo script `test`) |
+| 16 | Pruebas de usabilidad, responsividad y accesibilidad | Media | Hitos 12-13 |
+
+---
+
+### Hito 11 — Catálogo CIE-10 + mapeo de síntomas a CIE-10 + filtro de relevancia
+
+**Objetivo:** pasar de un campo libre `codigo_cie10` a un modelo con catálogo oficial,
+traducción de texto/síntomas coloquiales a códigos y ranking de diagnósticos.
+
+**11.1 Catálogo en la capa de datos**
+- Crear `database/migraciones/004_cie10_catalogo.sql` y agregar la tabla al final de `database/schema.sql`:
+  ```sql
+  CREATE TABLE IF NOT EXISTS cie10_categorias (
+    id INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    codigo VARCHAR(10) NOT NULL UNIQUE,        -- ej. 'J02'
+    descripcion VARCHAR(255) NOT NULL,         -- ej. 'Faringitis aguda'
+    capitulo VARCHAR(120),
+    INDEX idx_cie10_desc (descripcion)
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+  ```
+- Crear `server/scripts/seed-cie10.js` (Node + `mysql2/promise`) que cargue el catálogo
+  (fuente pública CIE-10, formato CSV/JSON) con `INSERT ... ON DUPLICATE KEY UPDATE` e
+  inserciones por lotes. Agregar script npm `"seed:cie10"` en `server/package.json`.
+
+**11.2 Mapeador local (búsqueda textual normalizada)**
+- Crear `server/src/services/cie10Service.js` con:
+  - `normalizar(texto)`: mayúsculas, sin tildes, sin signos de puntuación.
+  - `buscarPorTexto(q, limite)`: `SELECT ... WHERE descripcion LIKE ?` (prefijo) + FULLTEXT.
+- Endpoint **`GET /api/cie10?q=`** (protegido por JWT) en `server/src/routes/cie10Routes.js`
+  → autocompletado del frontend.
+
+**11.3 Mapeador semántico con Groq (texto coloquial → CIE-10)**
+- Crear `server/src/services/cie10MapperService.js` (reutiliza el modelo ya usado, `qwen/qwen3.6-27b`):
+  ```js
+  const Groq = require('groq-sdk');
+  const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
+
+  // Convierte síntomas coloquiales en candidatos CIE-10 con relevancia
+  const mapearSintoma = async (descripcion) => {
+    const completion = await groq.chat.completions.create({
+      model: 'qwen/qwen3.6-27b',
+      temperature: 0.2,
+      messages: [
+        {
+          role: 'system',
+          content:
+            'Eres un codificador clínico. Devuelve SOLO un JSON: ' +
+            '{"codigo_encontrado": null, "candidatos": [' +
+            '{"codigo":"J02","descripcion":"Faringitis aguda","relevancia":0.9}], ' +
+            '"texto_normalizado":"..."}. Usa la CIE-10.',
+        },
+        { role: 'user', content: `Paciente refiere: ${descripcion}` },
+      ],
+      response_format: { type: 'json_object' },
+    });
+    return JSON.parse(completion.choices[0].message.content);
+  };
+  module.exports = { mapearSintoma };
+  ```
+- Los candidatos devueltos por la IA se **contrastan contra `cie10_categorias`** para
+  confirmar que el código existe en el catálogo.
+- Endpoint **`POST /api/cie10/mapear`** (`{ descripcion }`) con validación de entrada
+  reutilizando el patrón de los controladores actuales (errores con `statusCode`).
+
+**11.4 Filtro de relevancia de diagnósticos**
+- Crear `server/src/services/relevanciaService.js`:
+  - Modificar el `systemPrompt` de `recetaController.analizarReceta()` para que devuelva
+    `diagnosticos_candidatos: [{ texto, codigo_cie10, relevancia }]`.
+  - `calcularRelevancia(candidatos, medicamentos)` → puntúa `relevancia * 0.7 + coincidencia
+    de tokens con los medicamentos prescritos * 0.3`, ordena descendente y descarta `score < 0.5`.
+  - El diagnóstico de mayor score llena `diagnostico` y `codigo_cie10`; los demás se devuelven
+    al frontend para validación humana.
+
+**11.5 Frontend**
+- `FormularioValidacion.jsx`: campo `diagnostico` con autocompletado desde `GET /api/cie10?q=`
+  y botón "Traducir a CIE-10" que llama a `POST /api/cie10/mapear` y muestra los candidatos
+  ordenados por relevancia para confirmar.
+- `RecetaDetalle.jsx`: mostrar el diagnóstico principal y las alternativas con su relevancia.
+
+**Verificación:** `seed:cie10` carga el catálogo (COUNT > 13,000); `GET /api/cie10?q=` responde
+200 en <50 ms (índices); `POST /api/cie10/mapear` con "me duele la garganta" → J02 relevancia > 0.8;
+un diagnóstico candidato con score < 0.5 queda fuera del ranking.
+
+---
+
+### Hito 12 — Cámara `getUserMedia` + geolocalización en tiempo real + búsqueda por dirección
+
+**Objetivo:** captura fotográfica con visor real (no solo `capture`), seguimiento de ubicación
+en vivo y geocodificación por dirección para las farmacias.
+
+**12.1 Componente de cámara (capa visualización)**
+- Crear `client/src/components/CameraCapture.jsx`:
+  ```jsx
+  import { useRef, useState, useEffect } from 'react';
+
+  export default function CameraCapture({ onCapture, label = 'Tomar foto' }) {
+    const videoRef = useRef(null);
+    const streamRef = useRef(null);
+    const [activo, setActivo] = useState(false);
+
+    const iniciar = async () => {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: 'environment' },
+        audio: false,
+      });
+      streamRef.current = stream;
+      videoRef.current.srcObject = stream;
+      setActivo(true);
+    };
+
+    const capturar = () => {
+      const canvas = document.createElement('canvas');
+      const v = videoRef.current;
+      canvas.width = v.videoWidth;
+      canvas.height = v.videoHeight;
+      canvas.getContext('2d').drawImage(v, 0, 0);
+      onCapture(canvas.toDataURL('image/jpeg', 0.85)); // dataURL compatible con /analizar
+      detener();
+    };
+
+    const detener = () => {
+      streamRef.current?.getTracks().forEach((t) => t.stop());
+      setActivo(false);
+    };
+
+    useEffect(() => () => detener(), []);
+
+    return activo ? (
+      <div>
+        <video ref={videoRef} autoPlay playsInline muted className="w-full rounded-xl" />
+        <button type="button" onClick={capturar} className="btn-primary w-full mt-3">{label}</button>
+        <button type="button" onClick={detener} className="btn-secondary w-full mt-2">Cancelar</button>
+      </div>
+    ) : (
+      <button type="button" onClick={iniciar} className="btn-accent w-full">📷 {label}</button>
+    );
+  }
+  ```
+- Integrar en `RecetaScanner.jsx` y `Inventario.jsx` como alternativa a la zona de drag&drop,
+  manteniendo el flujo actual `imagenBase64 → POST /recetas/analizar | /inventario/analizar`.
+- Manejar permisos denegados (`NotAllowedError`) con mensaje claro y fallback al `input file`.
+
+**12.2 Geolocalización en tiempo real**
+- En `client/src/pages/Farmacias.jsx`, agregar modo "Seguimiento en vivo" con
+  `navigator.geolocation.watchPosition()` que actualiza `posicion` y re-consulta
+  `POST /api/farmacias/cercanas` cuando el desplazamiento supere un umbral (ej. 30 m).
+- Limpiar el watcher con `clearWatch()` en `useEffect` cleanup.
+
+**12.3 Búsqueda manual por dirección**
+- En el backend, crear **`POST /api/farmacias/geocodificar`** (`{ direccion }`) en
+  `farmaciaController.js` (mismo estilo de validación que `buscarCercanas`).
+- Implementación del servicio en `serpapiService.js` (geocoding vía SerpApi Google Maps)
+  o como fallback con Nominatim/OpenStreetMap; devolver `{ lat, lng }`.
+- En el frontend, input "Buscar farmacia por dirección" + botón "Buscar" → geocodifica,
+  centra el `MapContainer` (flyTo) y consulta las farmacias cercanas a esa coordenada.
+
+**Verificación:** captura desde cámara produce una imagen analizable por Groq; el mapa se
+actualiza solo al moverse (>30 m); escribir una dirección válida centra el mapa y lista farmacias.
+
+---
+
+### Hito 13 — Accesibilidad por voz: captura de síntomas (STT) y lectura de resultados (TTS)
+
+**Objetivo:** completar el dictado por voz (hoy solo sirve para el nombre del medicamento)
+y añadir la lectura de resultados en voz alta.
+
+**13.1 Hook reutilizable `client/src/hooks/useVoz.js`**
+- STT: extiende `react-speech-recognition` (ya instalado) con `continuous: true` para
+  capturar frases largas de síntomas.
+- TTS: usa la Web Speech API (`speechSynthesis`) con selección de voz en español:
+  ```js
+  const leerEnVozAlta = (texto) => {
+    if (!('speechSynthesis' in window)) return;
+    const voz = speechSynthesis.getVoices().find((v) => v.lang.startsWith('es'));
+    const u = new SpeechSynthesisUtterance(texto);
+    u.lang = 'es-MX';
+    u.rate = 0.95;
+    if (voz) u.voice = voz;
+    speechSynthesis.cancel();
+    speechSynthesis.speak(u);
+  };
+  ```
+
+**13.2 Captura de síntomas por voz**
+- Nueva vista (o sección en Dashboard): botón "🎤 Dictar mis síntomas" → el texto transcrito
+  se envía a `POST /api/cie10/mapear` (Hito 11) y se muestran los diagnósticos candidatos.
+
+**13.3 Lectura de resultados (TTS)**
+- Botón "🔊 Leer" en `RecetaDetalle.jsx` (lee diagnóstico y medicamentos) y en la vista de
+  precios de `Farmacias.jsx` (lee el medicamento y las ofertas más baratas).
+
+**Verificación:** dictado captura ≥1 síntoma completo en es-MX; reproducción audible en
+Chrome/Edge/Android; contraste de botones de voz cumpliendo WCAG AA (control del Temporary
+button del micrófono).
+
+---
+
+### Hito 14 — Pruebas automatizadas de integración IA ↔ Base de datos
+
+**Objetivo:** volver reproducible la validación E2E (hoy manual) con una suite de tests.
+
+- Agregar devDependencies `jest` y `supertest` en `server/package.json` y script `"test": "jest"`.
+- **Mock del LLM**: inyectar un `groq` falso en `recetaController` e `inventarioController`
+  (patrón inyección de dependencias o `jest.mock('groq-sdk')`) para que los tests no consuman
+  créditos ni dependan de red.
+- `server/tests/integracionReceta.test.js`: analizar (200, JSON estructurado) → guardar (201,
+  transaccional) → listar (aparece en historial) → detalle → editar → eliminar.
+- `server/tests/integracionInventario.test.js`: `analizar` (build del JSON de medicamentos),
+  CRUD, `batch`, alertas de caducidad (estado `caducado`/`por_vencer`/`vigente` correcto).
+- Tests de seguridad: 401 sin token, 404 para IDs ajenos al usuario, 400 con payloads inválidos.
+- Test E2E real opcional marcado (con `GROQ_API_KEY` real) que replica la verificación del
+  Hito 10 y guarda el resultado en `docs/pruebas_ia.md`.
+
+**Verificación:** `npm test` en servidor real + MySQL local pasa completo (la suite se integra
+al mismo `npm run dev` sin interferir; la BD debe estar levantada).
+
+---
+
+### Hito 15 — Pruebas de carga y rendimiento del backend
+
+**Objetivo:** línea base de rendimiento y umbrales de degradación.
+
+- Agregar devDependency `autocannon` (ligera) o configurar `artillery`.
+- `server/scripts/load-test.js`: script que golpea los endpoints de lectura principales
+  (`GET /api/health`, `GET /api/recetas?page=1`, `GET /api/inventario`, `GET /api/inventario/alertas`)
+  con 100 conexiones durante 30 s usando un JWT de prueba.
+- Guardar resultados y conclusiones en `docs/pruebas_carga.md` (p50/p95/p99, throughput,
+  errores). Ajustar `connectionLimit` del pool (`db.js`, hoy 10) según resultados.
+- Considerar habilitar gzip (`compression`) si el payload JSON del historial lo justifica.
+
+**Verificación:** informe con números de la máquina de desarrollo y, si se dispone,
+de una máquina de referencia; sin errores 5xx bajo carga normal.
+
+---
+
+### Hito 16 — Pruebas de usabilidad, responsividad y validaciones de accesibilidad
+
+**Objetivo:** cerrar la actividad 21 con evidencia reproducible.
+
+- **Accesibilidad automatizada:** integrar `@axe-core/react` en desarrollo (o `@axe-core/playwright`
+  en los e2e); correr Lighthouse y guardar reportes en `docs/lighthouse/`.
+- **Planes de acción WCAG 2.1 AA:**
+  - Auditoría de contraste de la paleta (`primary-600`/`accent-600` sobre blanco).
+  - Añadir `label` a inputs que hoy dependen solo de `placeholder` (`Farmacias`, `Dashboard`,
+    formulario de inventario).
+  - Revisar foco visible (`focus-visible`) y jerarquía de encabezados en las páginas.
+- **Responsividad:** probar breakpoints 320 / 375 / 768 / 1024 px en `RecetaScanner`,
+  `Inventario`, `Farmacias`, `Dashboard` y la vista comparativa de precios; documentar con
+  capturas en `docs/pruebas_ux.md`.
+- **E2E Playwright** (si el tiempo lo permite): login → escanear → validar → guardar →
+  inventario → farmacias, con checks básicos de accesibilidad.
+
+**Verificación:** reportes Lighthouse ≥ 90 en Accesibilidad y Mejores Prácticas; checklist de
+WCAG AA revisado sin incidencias críticas; capturas de los 4 breakpoints por pantalla.
+
+---
+
+## Mejoras adicionales (deuda técnica detectada en la auditoría)
+
+- **`medico_nombre` nunca se extrae:** el `systemPrompt` de `recetaController.analizarReceta()`
+  no pide este campo aunque la tabla lo almacena. Agregarlo al prompt y mapearlo en
+  `FormularioValidacion.jsx`.
+- **Code-splitting del cliente (~524 kB):** cargar `react-leaflet`/`leaflet` y
+  `react-speech-recognition` con `React.lazy`/`dynamic import` solo en las vistas que los usan.
+- **Secretos en el working tree:** `server/.env` y `client/.env` existen localmente; al rotar
+  claves, verificar que `.gitignore` los excluya y nunca versionarlos.
+- **Activar notificaciones en producción:** `NOTIF_CRON_ENABLED=true` una vez desplegado.
+- **Opcional (hito 10 ampliado):** leer códigos GS1 DataMatrix (GTIN/lote/caducidad exactos)
+  con ZXing-js, cayendo al análisis visual de Groq si no se detecta.
