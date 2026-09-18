@@ -1,10 +1,12 @@
 # Dependencias
 node_modules/
 
-# Variables de entorno
+# Variables de entorno (NUNCA subir a Git)
 .env
-.env.local
-.env.*.local
+.env.*
+**/.env
+**/.env.*
+!**/.env.example
 
 # Build
 client/dist/

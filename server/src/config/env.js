@@ -54,6 +54,7 @@ module.exports = {
 
   // APIs externas
   groqApiKey: process.env.GROQ_API_KEY || '',
+  groqModel: process.env.GROQ_MODEL || 'qwen/qwen3.8-27b',
   serpApiKey: process.env.SERPAPI_KEY || '',
 
   // Google OAuth

@@ -35,7 +35,7 @@ directamente; todo pasa por la API REST.
 | Frontend | React 18 + Vite + Tailwind CSS 3 + React Router + Leaflet/react-leaflet + react-speech-recognition + @react-oauth/google |
 | Backend | Node.js + Express 5 + MySQL (mysql2/promise) + JWT + Nodemailer + node-cron |
 | BD | MySQL 8 (InnoDB, utf8mb4), pool de conexiones en `server/src/config/db.js` |
-| IA | Groq SDK — modelo `qwen/qwen3.6-27b`, `temperature 0.1`, `response_format: {type:"json_object"}` |
+| IA | Groq SDK — modelo `qwen/qwen3.8-27b`, `temperature 0.1`, `max_tokens 800`, `response_format: {type:"json_object"}` |
 | APIs externas | SerpApi (Google Shopping + Google Maps), Google OAuth (verifyIdToken) |
 
 ## 3. Estructura del repositorio
@@ -85,7 +85,7 @@ directamente; todo pasa por la API REST.
 5. **Seguridad**: SQL siempre parametrizado (`?`), verificaciones de propiedad (`usuario_id`)
    en lecturas/actualizaciones/eliminaciones, transacciones para escrituras múltiples.
 6. **IA**: prompts estrictos que devuelven SOLO JSON, `response_format: { type: "json_object" }`,
-   modelo `qwen/qwen3.6-27b`, `temperature: 0.1`. Comprimir imágenes con `sharp` antes de Groq.
+   modelo `qwen/qwen3.8-27b`, `temperature: 0.1`, `max_tokens: 800`. Comprimir imágenes con `sharp` antes de Groq.
 7. Español en mensajes de interfaz y DOM. Sin secretos en el repo (`.env` ignorados).
 8. No añadir comentarios innecesarios al código; el estilo existente usa comentarios `/** */`
    de cabecera de función.

@@ -6,6 +6,8 @@
  */
 
 const Groq = require('groq-sdk');
+const sharp = require('sharp');
+const config = require('../config/env');
 const recetaModel = require('../models/recetaModel');
 
 // Inicializar SDK con la variable de entorno
@@ -13,11 +15,36 @@ const groq = new Groq({
   apiKey: process.env.GROQ_API_KEY
 });
 
+/**
+ * Comprime la imagen (data URL) antes de enviarla a Groq para reducir
+ * el consumo de tokens y asegurar compatibilidad con el límite de cuota.
+ *
+ * @param {string} dataUrl - Imagen en Base64 con prefijo data:image/...
+ * @returns {Promise<string>} Data URL comprimido o el original si falla
+ */
+const comprimirImagen = async (dataUrl) => {
+  try {
+    const coincidencia = dataUrl.match(/^data:image\/[\w.+-]+;base64,(.+)$/);
+    if (!coincidencia) return dataUrl;
+
+    const buffer = Buffer.from(coincidencia[1], 'base64');
+    const comprimido = await sharp(buffer)
+      .resize({ width: 1280, height: 1280, fit: 'inside', withoutEnlargement: true })
+      .jpeg({ quality: 80 })
+      .toBuffer();
+
+    return `data:image/jpeg;base64,${comprimido.toString('base64')}`;
+  } catch (error) {
+    console.warn('No se pudo comprimir la imagen de la receta; se enviará la original:', error.message);
+    return dataUrl;
+  }
+};
+
 const recetaController = {
   /**
    * POST /api/recetas/analizar
    * Recibe la imagen en formato Base64 enviada desde el cliente (application/json),
-   * valida su existencia y la envía a Llama 3 Vision para extraer los datos médicos
+   * valida su existencia y la envía a Groq Vision para extraer los datos médicos
    * devolviendo un JSON estructurado.
    */
   async analizarReceta(req, res, next) {
@@ -31,7 +58,9 @@ const recetaController = {
         throw error;
       }
 
-      console.log('Enviando imagen Base64 a Llama 3 Vision (Groq)...');
+      // Comprimir la imagen antes de enviar a Groq para optimizar tokens
+      const imagenComprimida = await comprimirImagen(imagenBase64);
+      console.log('Enviando imagen Base64 a IA Vision (Groq)...');
 
       // 2. Definir el System Prompt robusto para asegurar JSON
       const systemPrompt = `
@@ -44,6 +73,7 @@ const recetaController = {
       {
         "paciente_nombre": "Nombre completo del paciente o null si no se detecta",
         "fecha_emision": "Fecha de la receta (ej. YYYY-MM-DD) o null si no se detecta",
+        "medico_nombre": "Nombre del médico o null si no se detecta",
         "medico_cedula": "Cédula profesional del médico o null si no se detecta",
         "diagnostico": "Diagnóstico principal descrito en la receta o null",
         "medicamentos": [
@@ -56,32 +86,44 @@ const recetaController = {
       }
       `;
 
-      // 3. Petición a Groq
-      const completion = await groq.chat.completions.create({
-        messages: [
-          {
-            role: "system",
-            content: systemPrompt
-          },
-          {
-            role: "user",
-            content: [
-              { type: "text", text: "Analiza esta receta médica y devuelve el JSON solicitado." },
+      // 3. Petición a Groq con reintento ante fallos de formato JSON
+      let completion;
+      const maxIntentos = 2;
+      const modeloIa = config.groqModel || process.env.GROQ_MODEL || "qwen/qwen3.8-27b";
+
+      for (let intento = 1; intento <= maxIntentos; intento++) {
+        try {
+          completion = await groq.chat.completions.create({
+            messages: [
               {
-                type: "image_url",
-                image_url: {
-                  url: imagenBase64
-                }
+                role: "system",
+                content: systemPrompt
+              },
+              {
+                role: "user",
+                content: [
+                  { type: "text", text: "Analiza esta receta médica y devuelve el JSON solicitado." },
+                  {
+                    type: "image_url",
+                    image_url: {
+                      url: imagenComprimida
+                    }
+                  }
+                ]
               }
-            ]
-          }
-        ],
-        model: "qwen/qwen3.6-27b",
-        temperature: 0.1, // Baja temperatura para respuestas consistentes y predecibles
-        // En algunos modelos de Groq, response_format { type: "json_object" } asegura JSON, 
-        // pero para visión a veces es mejor forzarlo solo con el prompt. Lo añadiremos por seguridad.
-        response_format: { type: "json_object" }
-      });
+            ],
+            model: modeloIa,
+            temperature: 0.1,
+            max_tokens: 800,
+            response_format: { type: "json_object" }
+          });
+          break;
+        } catch (apiError) {
+          const esFalloJson = apiError?.code === 'json_validate_failed';
+          if (!esFalloJson || intento === maxIntentos) throw apiError;
+          console.warn(`Groq falló validación JSON en receta (intento ${intento}); reintentando...`);
+        }
+      }
 
       // 4. Parsear la respuesta y manejar errores
       const aiResponse = completion.choices[0].message.content;
@@ -107,8 +149,10 @@ const recetaController = {
 
     } catch (error) {
       console.error('Error en analizarReceta (Groq API):', error);
-      // Mapear el error a un 500 interno si no fue validación previa (400)
-      if (!error.statusCode) {
+      if (error?.status === 429 || error?.code === 'rate_limit_exceeded') {
+        error.statusCode = 429;
+        error.message = 'El motor de IA está procesando demasiadas solicitudes en este momento. Por favor, espera unos segundos e inténtalo de nuevo.';
+      } else if (!error.statusCode) {
         error.statusCode = 500;
         error.message = 'Error interno al comunicarse con el motor de Inteligencia Artificial.';
       }

@@ -7,6 +7,7 @@
 
 const Groq = require('groq-sdk');
 const sharp = require('sharp');
+const config = require('../config/env');
 const medicamentoModel = require('../models/medicamentoModel');
 
 // Inicializar SDK de Groq con la variable de entorno
@@ -225,8 +226,9 @@ const inventarioController = {
                 ]
               }
             ],
-            model: "qwen/qwen3.6-27b",
+            model: config.groqModel || process.env.GROQ_MODEL || "qwen/qwen3.8-27b",
             temperature: 0.1,
+            max_tokens: 800,
             response_format: { type: "json_object" }
           });
           break;
@@ -265,7 +267,10 @@ const inventarioController = {
 
     } catch (error) {
       console.error('Error en analizar medicamento (Groq API):', error);
-      if (!error.statusCode) {
+      if (error?.status === 429 || error?.code === 'rate_limit_exceeded') {
+        error.statusCode = 429;
+        error.message = 'El motor de IA está procesando demasiadas solicitudes en este momento. Por favor, espera unos segundos e inténtalo de nuevo.';
+      } else if (!error.statusCode) {
         error.statusCode = 500;
         error.message = 'Error interno al comunicarse con el motor de Inteligencia Artificial.';
       }
